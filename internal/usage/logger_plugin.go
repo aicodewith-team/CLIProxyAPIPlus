@@ -63,7 +63,13 @@ func (p *LoggerPlugin) HandleUsage(ctx context.Context, record coreusage.Record)
 }
 
 // SetStatisticsEnabled toggles whether in-memory statistics are recorded.
-func SetStatisticsEnabled(enabled bool) { statisticsEnabled.Store(enabled) }
+// When persistence has been configured, enabling starts the snapshot saver
+// without reloading a file that was already applied, and disabling flushes
+// once then stops the saver so a reload cannot double-start it or drop data.
+func SetStatisticsEnabled(enabled bool) {
+	statisticsEnabled.Store(enabled)
+	syncStatisticsPersister(enabled)
+}
 
 // StatisticsEnabled reports the current recording state.
 func StatisticsEnabled() bool { return statisticsEnabled.Load() }
@@ -224,6 +230,9 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+	if s == defaultRequestStatistics {
+		defaultStatisticsDirty.Store(true)
+	}
 }
 
 func (s *RequestStatistics) apiStatsForKey(key string) *apiStats {

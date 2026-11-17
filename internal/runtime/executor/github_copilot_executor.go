@@ -365,6 +365,7 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, maxScannerBufferSize)
 		var param any
+		var streamUsage helps.StreamUsageBuffer
 
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -390,8 +391,10 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 							reporter.publishFailure(ctx)
 						}
 					}
-				} else if detail, ok := parseOpenAIStreamUsage(line); ok {
-					reporter.publish(ctx, detail)
+				} else {
+					// Buffer chat-completions usage until the stream ends so mid-stream
+					// service_tier-only chunks cannot publish 0 tokens and hide the finish usage.
+					streamUsage.ObserveOpenAIStream(line)
 				}
 			}
 
@@ -432,9 +435,13 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 
 		if errScan := scanner.Err(); errScan != nil {
 			recordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.publishFailure(ctx)
+			if useResponses || !publishCopilotChatStreamUsage(ctx, reporter, &streamUsage, true) {
+				reporter.publishFailure(ctx)
+			}
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
-		} else {
+		} else if useResponses {
+			reporter.ensurePublished(ctx)
+		} else if !publishCopilotChatStreamUsage(ctx, reporter, &streamUsage, false) {
 			reporter.ensurePublished(ctx)
 		}
 	}()
@@ -443,6 +450,31 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		Headers: httpResp.Header.Clone(),
 		Chunks:  out,
 	}, nil
+}
+
+func publishCopilotChatStreamUsage(ctx context.Context, reporter *usageReporter, buf *helps.StreamUsageBuffer, requireTokens bool) bool {
+	if reporter == nil || reporter.reporter == nil || buf == nil {
+		return false
+	}
+	if requireTokens && !copilotStreamUsageHasTokens(buf) {
+		return false
+	}
+	return buf.Publish(ctx, reporter.reporter)
+}
+
+func copilotStreamUsageHasTokens(buf *helps.StreamUsageBuffer) bool {
+	detail, ok := buf.Detail()
+	if !ok {
+		return false
+	}
+	return detail.InputTokens != 0 ||
+		detail.OutputTokens != 0 ||
+		detail.ReasoningTokens != 0 ||
+		detail.CachedTokens != 0 ||
+		detail.CacheReadTokens != 0 ||
+		detail.CacheCreationTokens != 0 ||
+		detail.TotalTokens != 0 ||
+		detail.TokenBreakdown.TotalTokens != 0
 }
 
 // CountTokens estimates token count locally using tiktoken, since the GitHub
