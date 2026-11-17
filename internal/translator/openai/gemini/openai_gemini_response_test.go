@@ -276,3 +276,34 @@ func TestConvertOpenAIResponseToGeminiStream_ContentWithFinishReason(t *testing.
 		t.Fatalf("want thoughtText thinking and finishReason MAX_TOKENS, got thought=%q reason=%q chunks=%q", thoughtText, reasoningFinish, reasoningOut)
 	}
 }
+
+func TestConvertOpenAIResponseToGeminiStream_UsageOnFinishChunk(t *testing.T) {
+	var param any
+	ConvertOpenAIResponseToGemini(context.Background(), "gpt-test", nil, nil, []byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`), &param)
+	out := ConvertOpenAIResponseToGemini(context.Background(), "gpt-test", nil, nil, []byte(`{"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}`), &param)
+
+	var text, reason string
+	var promptTokens, completionTokens, totalTokens int64
+	var sawUsage bool
+	for _, c := range out {
+		if s := ojson.GetBytesNoCopy(c, "candidates.0.content.parts.0.text").String(); s != "" {
+			text = s
+		}
+		if s := ojson.GetBytesNoCopy(c, "candidates.0.finishReason").String(); s != "" {
+			reason = s
+		}
+		usage := ojson.GetBytesNoCopy(c, "usageMetadata")
+		if usage.Exists() {
+			sawUsage = true
+			promptTokens = usage.Get("promptTokenCount").Int()
+			completionTokens = usage.Get("candidatesTokenCount").Int()
+			totalTokens = usage.Get("totalTokenCount").Int()
+		}
+	}
+	if text != "OK" || reason != "STOP" {
+		t.Fatalf("want text OK and finishReason STOP, got text=%q reason=%q chunks=%q", text, reason, out)
+	}
+	if !sawUsage || promptTokens != 12 || completionTokens != 3 || totalTokens != 15 {
+		t.Fatalf("want usageMetadata 12/3/15 on the finish chunk, got saw=%v prompt=%d candidates=%d total=%d chunks=%q", sawUsage, promptTokens, completionTokens, totalTokens, out)
+	}
+}

@@ -1130,3 +1130,104 @@ func TestGitHubCopilotResponsesStreamAccounting(t *testing.T) {
 		})
 	}
 }
+
+type copilotChatUsageCaptureKey struct{}
+type copilotChatUsageCapturePlugin struct{}
+
+func (copilotChatUsageCapturePlugin) HandleUsage(ctx context.Context, record usage.Record) {
+	if records, ok := ctx.Value(copilotChatUsageCaptureKey{}).(chan usage.Record); ok {
+		records <- record
+	}
+}
+
+func TestGitHubCopilotChatStreamUsageIgnoresServiceTierChunks(t *testing.T) {
+	// Mid-stream Copilot chat chunks often include service_tier without tokens.
+	// Publishing those first would lock in 0 tokens and drop the finish usage.
+	usage.RegisterNamedPlugin("test:copilot-chat-accounting", copilotChatUsageCapturePlugin{})
+	const tokenUsage = `{"input_tokens":9,"output_tokens":5,"total_tokens":14,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}`
+	wire := "data: {\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":" + tokenUsage + "}\n\n" +
+		"data: {\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	for _, tc := range []struct {
+		name        string
+		truncated   bool
+		wantReadErr bool
+	}{
+		{name: "early and trailing service tier keep finish usage"},
+		{name: "usage before transport error still records tokens", truncated: true, wantReadErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/chat/completions" {
+					t.Errorf("path = %q, want %q", r.URL.Path, "/chat/completions")
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				if tc.truncated {
+					w.Header().Set("Content-Length", fmt.Sprint(len(wire)+100))
+				}
+				_, _ = io.WriteString(w, wire)
+			}))
+			defer server.Close()
+			e := NewGitHubCopilotExecutor(&config.Config{})
+			e.cache["test-token"] = &cachedAPIToken{token: "test-api-token", apiEndpoint: server.URL, expiresAt: time.Now().Add(time.Hour)}
+			auth := &cliproxyauth.Auth{ID: t.Name(), Metadata: map[string]any{"access_token": "test-token"}}
+			records := make(chan usage.Record, 16)
+			ctx := context.WithValue(context.Background(), copilotChatUsageCaptureKey{}, records)
+			payload := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"stream":true}`)
+			result, err := e.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "gpt-4o", Payload: payload}, cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FromString("openai"), OriginalRequest: payload,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var streamErr error
+			for chunk := range result.Chunks {
+				if chunk.Err != nil {
+					streamErr = chunk.Err
+				}
+			}
+			if tc.wantReadErr {
+				if !errors.Is(streamErr, io.ErrUnexpectedEOF) {
+					t.Errorf("stream error = %v, want unexpected EOF", streamErr)
+				}
+			} else if streamErr != nil {
+				t.Errorf("stream error = %v, want nil", streamErr)
+			}
+
+			usage.PublishRecord(ctx, usage.Record{Model: "accounting-barrier"})
+			stats := usagestats.NewRequestStatistics()
+			var captured []usage.Record
+			timer := time.NewTimer(5 * time.Second)
+			defer timer.Stop()
+		drain:
+			for {
+				select {
+				case record := <-records:
+					if record.Model == "accounting-barrier" {
+						break drain
+					}
+					captured = append(captured, record)
+					stats.Record(ctx, record)
+				case <-timer.C:
+					t.Fatal("timed out waiting for usage queue barrier")
+				}
+			}
+			if len(captured) != 1 {
+				t.Fatalf("usage records = %d, want exactly one", len(captured))
+			}
+			record := captured[0]
+			if record.Failed || record.Detail.TotalTokens != 14 {
+				t.Errorf("usage = %+v, want failed=false total=14", record)
+			}
+			if record.Detail.InputTokens != 9 || record.Detail.OutputTokens != 5 || record.Detail.CachedTokens != 3 || record.Detail.ReasoningTokens != 2 {
+				t.Errorf("token breakdown = %+v, want input=9 output=5 cached=3 reasoning=2", record.Detail)
+			}
+			snapshot := stats.Snapshot()
+			if snapshot.TotalRequests != 1 || snapshot.FailureCount != 0 || snapshot.SuccessCount != 1 || snapshot.TotalTokens != 14 {
+				t.Errorf("management counts = %+v, want requests=1 failures=0 total=14", snapshot)
+			}
+		})
+	}
+}

@@ -57,6 +57,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}()
 
 	s.applyUsageStatisticsConfig(s.cfg)
+	internalusage.ConfigureStatisticsPersistence(s.cfg)
 	s.startModelCatalogUpdaters(ctx)
 	usage.StartDefault(ctx)
 	cfg := s.currentConfig()
@@ -421,6 +422,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		helps.RetireProxyPoolPublisher(s.proxyPoolPublisher)
 		usage.StopDefault()
+		internalusage.FlushAndStopStatisticsPersistence()
 	})
 	return shutdownErr
 }

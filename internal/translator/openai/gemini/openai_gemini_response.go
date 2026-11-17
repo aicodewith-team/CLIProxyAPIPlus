@@ -248,6 +248,13 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 					(*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator = make(map[int]*ToolCallAccumulator)
 				}
 
+				// Copilot (and some OpenAI-compatible streams) put usage on the same
+				// chunk as finish_reason. Map it onto this end packet so we don't
+				// drop usageMetadata by returning early.
+				if usage := root.Get("usage"); usage.Exists() {
+					setGeminiUsageMetadataFromOpenAIUsageDoc(templateDoc, usage)
+				}
+
 				results = append(results, templateDoc.Bytes())
 				return true
 			}
