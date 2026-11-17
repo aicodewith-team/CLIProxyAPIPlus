@@ -1697,6 +1697,33 @@ func TestManagementUsageEndpointsRequireManagementAuthAndServePlusContracts(t *t
 		t.Fatalf("legacy usage payload = %+v, want zeroed statistics", usagePayload)
 	}
 
+	missingV8Req := httptest.NewRequest(http.MethodGet, "/v8/management/usage", nil)
+	missingV8RR := httptest.NewRecorder()
+	server.engine.ServeHTTP(missingV8RR, missingV8Req)
+	if missingV8RR.Code != http.StatusUnauthorized {
+		t.Fatalf("missing v8 usage key status = %d, want %d body=%s", missingV8RR.Code, http.StatusUnauthorized, missingV8RR.Body.String())
+	}
+
+	v8Req := httptest.NewRequest(http.MethodGet, "/v8/management/usage", nil)
+	v8Req.Header.Set("Authorization", "Bearer test-management-key")
+	v8RR := httptest.NewRecorder()
+	server.engine.ServeHTTP(v8RR, v8Req)
+	if v8RR.Code != http.StatusOK {
+		t.Fatalf("v8 usage status = %d, want %d body=%s", v8RR.Code, http.StatusOK, v8RR.Body.String())
+	}
+	var v8Payload struct {
+		Usage struct {
+			TotalRequests int64 `json:"total_requests"`
+		} `json:"usage"`
+		FailedRequests int64 `json:"failed_requests"`
+	}
+	if errUnmarshal := json.Unmarshal(v8RR.Body.Bytes(), &v8Payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal v8 usage response: %v body=%s", errUnmarshal, v8RR.Body.String())
+	}
+	if v8Payload.Usage.TotalRequests != 0 || v8Payload.FailedRequests != 0 {
+		t.Fatalf("v8 usage payload = %+v, want zeroed statistics", v8Payload)
+	}
+
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
 	authReq.Header.Set("Authorization", "Bearer test-management-key")
 	authRR := httptest.NewRecorder()
